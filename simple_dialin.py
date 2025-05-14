@@ -132,12 +132,12 @@ async def handle_idle(processor, retry_count):
         return True
     elif retry_count == 2:
         logger.debug(f"Sending second silence prompt (retry count: {retry_count})")
-        await processor.push_frame(TTSSpeakFrame("Would you like to continue?"))
+        await processor.push_frame(TTSSpeakFrame("Are you still there? I will be terminating the call if you don't respond within next 10 seconds."))
         return True
     else:
         logger.debug(f"Ending call after {retry_count} silence prompts")
-        await processor.push_frame(TTSSpeakFrame("Goodbye!"))
-        await processor.push_frame(EndTaskFrame())
+        await processor.push_frame(TTSSpeakFrame("Goodbye! Terminating the call now."))
+        await processor.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
         return False
 
 
@@ -304,7 +304,7 @@ async def main(
     # ------------ LLM AND CONTEXT SETUP ------------
 
     # Set up the system instruction for the LLM
-    system_instruction = """You are Chatbot, a friendly, helpful robot. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way, but keep your responses brief. Start by introducing yourself. If the user ends the conversation, **IMMEDIATELY** call the `terminate_call` function. """
+    system_instruction = """You are Chatbot, a friendly, helpful robot. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way, but keep your responses brief. Start by introducing yourself. the user ends the conversation, **IMMEDIATELY** call the `terminate_call` function and DO NOT generate any text response. """
 
     # Initialize LLM
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
