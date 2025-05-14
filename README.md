@@ -59,6 +59,15 @@ curl -X POST "http://localhost:7860/start" \
 
 This returns a Daily room URL where you can test the bot's basic conversation capabilities.
 
+Steps to test silence detection capability:
+
+1. Join the Daily room URL returned from the curl command.
+2. The bot will join the call and greet you with a welcome message.
+3. Respond to the message and stay silent after that.
+4. The silence detection prompts will be activated 10 seconds after the end of previous conversation.
+5. You can jump in at anytime to continue conversing with the phone chatbot and the silence prompts will reset.
+6. If you continue staying silent for 3 consecutive 10 second time periods, the bot will terminate the call gracefully and exit the Daily room.
+
 ## Important Notes about the Silence Detection Implementation
 
 The following changes have been made to the Simple_dialin.py implementation that is available on pipecat's github repo.
@@ -67,4 +76,4 @@ The following changes have been made to the Simple_dialin.py implementation that
 - If no response from the user, the second silence prompt ("Are you still there? Call will end in 10 seconds if you don't respond.") is sent to the user.
 - If the user still does not respond, the final silence prompt ("Terminating the call now. Goodbye!") is sent to the user and the call is set to be gravefully terminated.
 
-I have also added a simple call summary log that contains information about the call, like the call ID, participant ID, number of silence prompts sent from the bot, and the overall call duration.
+I have also added a simple call summary log that contains information about the call, like the call ID, participant ID, number of silence prompts sent from the bot, and the overall call duration. The log will be saved to logs/ directory in the same project folder.
