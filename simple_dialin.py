@@ -28,12 +28,14 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     LLMMessagesFrame,
     TextFrame,
+    TTSSpeakFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.processors.user_idle_processor import UserIdleProcessor
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
@@ -122,6 +124,23 @@ Silence Events: {len(self.silence_events)}
         logger.info(self.get_summary())
 
 
+async def handle_idle(processor, retry_count):
+    """Handle user idle state with escalating prompts."""
+    if retry_count == 1:
+        logger.debug(f"Sending first silence prompt (retry count: {retry_count})")
+        await processor.push_frame(TTSSpeakFrame("Are you still there?"))
+        return True
+    elif retry_count == 2:
+        logger.debug(f"Sending second silence prompt (retry count: {retry_count})")
+        await processor.push_frame(TTSSpeakFrame("Would you like to continue?"))
+        return True
+    else:
+        logger.debug(f"Ending call after {retry_count} silence prompts")
+        await processor.push_frame(TTSSpeakFrame("Goodbye!"))
+        await processor.push_frame(EndTaskFrame())
+        return False
+
+
 class SilenceDetector(FrameProcessor):
     """Frame processor that detects silence and triggers a prompt after a threshold."""
 
@@ -129,11 +148,20 @@ class SilenceDetector(FrameProcessor):
         super().__init__()
         self.silence_threshold_seconds = silence_threshold_seconds
         self.last_bot_speech_end = time.time()
-        self.silence_prompt_sent = False
+        self.last_silence_prompt_time = 0
         self.call_stats = CallStats()
         self.current_silence_start = None
         self.bot_is_speaking = False
         self.user_is_speaking = False
+        self.consecutive_silence_prompts = 0
+        self.pending_silence_prompt = False
+        self.is_silence_prompt_speaking = False
+        self.last_silence_prompt_sent_time = 0
+        self.context_aggregator = None
+
+    def set_context_aggregator(self, context_aggregator):
+        """Set the context aggregator for updating LLM context."""
+        self.context_aggregator = context_aggregator
 
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
@@ -152,7 +180,11 @@ class SilenceDetector(FrameProcessor):
                 )
                 self.current_silence_start = None
             
-            self.silence_prompt_sent = False
+            # Reset silence tracking when user starts speaking
+            self.last_silence_prompt_time = 0
+            self.consecutive_silence_prompts = 0
+            self.pending_silence_prompt = False
+            self.is_silence_prompt_speaking = False
             self.call_stats.total_speech_segments += 1
             logger.debug(f"User started speaking at {current_time:.2f}s")
             
@@ -170,23 +202,15 @@ class SilenceDetector(FrameProcessor):
             # Only start silence timer if user is not speaking
             if not self.user_is_speaking:
                 self.current_silence_start = current_time
+            # Reset silence prompt speaking state when bot stops speaking
+            if self.is_silence_prompt_speaking:
+                self.is_silence_prompt_speaking = False
+                logger.debug(f"Silence prompt finished speaking at {current_time:.2f}s")
             logger.debug(f"Bot stopped speaking at {current_time:.2f}s")
 
-        # Check for silence only if neither bot nor user is speaking
-        if (not self.bot_is_speaking and 
-            not self.user_is_speaking and 
-            not self.silence_prompt_sent and 
-            (current_time - self.last_bot_speech_end) >= self.silence_threshold_seconds):
-            
-            logger.debug(f"Silence detected at {current_time:.2f}s, sending prompt")
-            self.silence_prompt_sent = True
-            
-            # Create a Text frame directly with the silence prompt
-            # This bypasses the LLM and goes straight to TTS
-            silence_message = TextFrame(text="Are you still there?")
-            await self.push_frame(silence_message, direction)
-
-        await self.push_frame(frame, direction)
+        # Always push the original frame in its original direction
+        if frame is not None:
+            await self.push_frame(frame, direction)
 
     def get_call_stats(self) -> CallStats:
         """Get the call statistics."""
@@ -295,16 +319,19 @@ async def main(
     context = OpenAILLMContext(messages, tools)
     context_aggregator = llm.create_context_aggregator(context)
 
-    # Initialize silence detector
+    # Initialize silence detector and idle processor
     silence_detector = SilenceDetector(silence_threshold_seconds=10)
+    user_idle = UserIdleProcessor(
+        callback=handle_idle,
+        timeout=10.0  # Seconds of silence before triggering
+    )
 
-    # ------------ PIPELINE SETUP ------------
-
-    # Build pipeline
+    # Build pipeline with idle processor
     pipeline = Pipeline(
         [
             transport.input(),  # Transport user input
-            silence_detector,  # Silence detection
+            silence_detector,   # Initial silence detection
+            user_idle,          # Idle processor with escalating prompts
             context_aggregator.user(),  # User responses
             llm,  # LLM
             tts,  # TTS
