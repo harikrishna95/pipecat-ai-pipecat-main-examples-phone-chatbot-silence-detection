@@ -47,26 +47,17 @@ load_dotenv(override=True)
 logs_dir = Path("logs")
 logs_dir.mkdir(exist_ok=True)
 
-# Configure logging
+# Configure logging - only file handler for call summary
 logger.remove()  # Remove all default handlers
 
-# Add console handler with DEBUG level and colored output
+# Add file handler for call summary only
 logger.add(
-    sys.stderr,
-    level="DEBUG",
-    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
-)
-
-# Add file handler for complete console logs
-logger.add(
-    logs_dir / "console_{time}.log",
+    logs_dir / "call_summary_{time}.log",
     rotation="1 day",
     retention="7 days",
-    level="DEBUG",
-    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
-    encoding="utf-8",
-    backtrace=True,
-    diagnose=True
+    level="INFO",
+    format="{message}",
+    encoding="utf-8"
 )
 
 daily_api_key = os.getenv("DAILY_API_KEY", "")
@@ -78,22 +69,15 @@ class CallStats:
     """Class to track call statistics."""
     start_time: float = field(default_factory=time.time)
     end_time: float = 0
-    silence_events: List[Dict] = field(default_factory=list)
+    silence_events: int = 0
     total_speech_segments: int = 0
-    total_silence_duration: float = 0
-    last_speech_end: float = 0
     call_id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S"))
     room_url: str = ""
     participant_id: str = ""
 
-    def add_silence_event(self, start_time: float, end_time: float, duration: float):
-        """Add a silence event to the tracking."""
-        self.silence_events.append({
-            "start_time": start_time,
-            "end_time": end_time,
-            "duration": duration
-        })
-        self.total_silence_duration += duration
+    def add_silence_event(self):
+        """Increment silence event counter."""
+        self.silence_events += 1
 
     def end_call(self):
         """Mark the end of the call and calculate final statistics."""
@@ -110,33 +94,34 @@ Room: {self.room_url}
 Participant: {self.participant_id}
 Duration: {call_duration:.2f} seconds
 Speech Segments: {self.total_speech_segments}
-Total Silence: {self.total_silence_duration:.2f} seconds
-Silence Events: {len(self.silence_events)}
+Total Silence Prompts Sent: {self.silence_events}
 """
 
     def save_to_file(self):
         """Save call statistics to a file."""
-        stats_file = logs_dir / f"call_summary_{self.call_id}.txt"
-        with open(stats_file, "w", encoding="utf-8") as f:
-            f.write(self.get_summary())
-        logger.info(f"Call statistics saved to {stats_file}")
-        # Log the summary to console
+        # Only use logger to write the summary
         logger.info(self.get_summary())
 
 
 async def handle_idle(processor, retry_count):
     """Handle user idle state with escalating prompts."""
     if retry_count == 1:
-        logger.debug(f"Sending first silence prompt (retry count: {retry_count})")
-        await processor.push_frame(TTSSpeakFrame("Are you still there?"))
+        await processor.push_frame(TTSSpeakFrame("Hello, are you around?"))
+        # Record silence event
+        if hasattr(processor, 'call_stats'):
+            processor.call_stats.add_silence_event()
         return True
     elif retry_count == 2:
-        logger.debug(f"Sending second silence prompt (retry count: {retry_count})")
-        await processor.push_frame(TTSSpeakFrame("Are you still there? I will be terminating the call if you don't respond within next 10 seconds."))
+        await processor.push_frame(TTSSpeakFrame("Are you still there? Call will end in 10 seconds if you don't respond."))
+        # Record silence event
+        if hasattr(processor, 'call_stats'):
+            processor.call_stats.add_silence_event()
         return True
     else:
-        logger.debug(f"Ending call after {retry_count} silence prompts")
-        await processor.push_frame(TTSSpeakFrame("Goodbye! Terminating the call now."))
+        await processor.push_frame(TTSSpeakFrame("Terminating the call now. Goodbye!"))
+        # Record final silence event
+        if hasattr(processor, 'call_stats'):
+            processor.call_stats.add_silence_event()
         await processor.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
         return False
 
@@ -170,43 +155,26 @@ class SilenceDetector(FrameProcessor):
 
         if isinstance(frame, UserStartedSpeakingFrame):
             self.user_is_speaking = True
-            # If we were in a silence period, record it
-            if self.current_silence_start is not None:
-                silence_duration = current_time - self.current_silence_start
-                self.call_stats.add_silence_event(
-                    self.current_silence_start,
-                    current_time,
-                    silence_duration
-                )
-                self.current_silence_start = None
-            
-            # Reset silence tracking when user starts speaking
+            self.current_silence_start = None
             self.last_silence_prompt_time = 0
             self.consecutive_silence_prompts = 0
             self.pending_silence_prompt = False
             self.is_silence_prompt_speaking = False
             self.call_stats.total_speech_segments += 1
-            logger.debug(f"User started speaking at {current_time:.2f}s")
             
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self.user_is_speaking = False
-            logger.debug(f"User stopped speaking at {current_time:.2f}s")
 
         elif isinstance(frame, BotStartedSpeakingFrame):
             self.bot_is_speaking = True
-            logger.debug(f"Bot started speaking at {current_time:.2f}s")
 
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self.bot_is_speaking = False
             self.last_bot_speech_end = current_time
-            # Only start silence timer if user is not speaking
             if not self.user_is_speaking:
                 self.current_silence_start = current_time
-            # Reset silence prompt speaking state when bot stops speaking
             if self.is_silence_prompt_speaking:
                 self.is_silence_prompt_speaking = False
-                logger.debug(f"Silence prompt finished speaking at {current_time:.2f}s")
-            logger.debug(f"Bot stopped speaking at {current_time:.2f}s")
 
         # Always push the original frame in its original direction
         if frame is not None:
@@ -324,11 +292,13 @@ async def main(
     call_stats = CallStats()
 
     # Initialize silence detector and idle processor
-    silence_detector = SilenceDetector(silence_threshold_seconds=10, call_stats = call_stats)
+    silence_detector = SilenceDetector(silence_threshold_seconds=10, call_stats=call_stats)
     user_idle = UserIdleProcessor(
         callback=handle_idle,
         timeout=10.0  # Seconds of silence before triggering
     )
+    # Set call_stats in user_idle processor
+    user_idle.call_stats = call_stats
 
     # Build pipeline with idle processor
     pipeline = Pipeline(
@@ -361,11 +331,6 @@ async def main(
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
         logger.debug(f"Participant left: {participant}, reason: {reason}")
-        # Get call statistics before canceling
-        call_stats = silence_detector.get_call_stats()
-        call_stats.end_call()
-        # Save statistics to file
-        call_stats.save_to_file()
         await task.cancel()
 
     # ------------ RUN PIPELINE ------------
