@@ -116,7 +116,7 @@ Silence Events: {len(self.silence_events)}
 
     def save_to_file(self):
         """Save call statistics to a file."""
-        stats_file = logs_dir / f"call_stats_{self.call_id}.txt"
+        stats_file = logs_dir / f"call_summary_{self.call_id}.txt"
         with open(stats_file, "w", encoding="utf-8") as f:
             f.write(self.get_summary())
         logger.info(f"Call statistics saved to {stats_file}")
@@ -144,12 +144,12 @@ async def handle_idle(processor, retry_count):
 class SilenceDetector(FrameProcessor):
     """Frame processor that detects silence and triggers a prompt after a threshold."""
 
-    def __init__(self, silence_threshold_seconds=10):
+    def __init__(self, silence_threshold_seconds=10, call_stats: CallStats = None):
         super().__init__()
         self.silence_threshold_seconds = silence_threshold_seconds
         self.last_bot_speech_end = time.time()
         self.last_silence_prompt_time = 0
-        self.call_stats = CallStats()
+        self.call_stats = call_stats or CallStats()
         self.current_silence_start = None
         self.bot_is_speaking = False
         self.user_is_speaking = False
@@ -319,8 +319,12 @@ async def main(
     context = OpenAILLMContext(messages, tools)
     context_aggregator = llm.create_context_aggregator(context)
 
+
+    # Initialize call stats
+    call_stats = CallStats()
+
     # Initialize silence detector and idle processor
-    silence_detector = SilenceDetector(silence_threshold_seconds=10)
+    silence_detector = SilenceDetector(silence_threshold_seconds=10, call_stats = call_stats)
     user_idle = UserIdleProcessor(
         callback=handle_idle,
         timeout=10.0  # Seconds of silence before triggering
@@ -368,10 +372,12 @@ async def main(
 
     if test_mode:
         logger.debug("Running in test mode (can be tested in Daily Prebuilt)")
-
-    runner = PipelineRunner()
-    await runner.run(task)
-
+    try:
+        runner = PipelineRunner()
+        await runner.run(task)
+    finally:
+        call_stats.end_call()
+        call_stats.save_to_file()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simple Dial-in Bot")
